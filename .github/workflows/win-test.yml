@@ -1,0 +1,109 @@
+name: win-test
+
+# Test-only branch: build the ghidra-12.2 branches on Windows and run them against Ghidra 12.2,
+# with and without the libghidra local_id fix.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows / Ghidra 12.2
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout ghidrasql
+        uses: actions/checkout@v4
+
+      - name: Checkout libghidra (fork, ghidra-12.2)
+        uses: actions/checkout@v4
+        with:
+          repository: rkn47/libghidra
+          ref: ghidra-12.2
+          path: libghidra
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.8.2"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download Ghidra 12.2 (two copies, one per extension build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -E '^[A-Za-z_][A-Za-z0-9_]*=' seed/versions.env > versions.sh
+          source versions.sh
+          curl -L --retry 5 --fail -sS -o "$RUNNER_TEMP/ghidra.zip" "$GHIDRA_URL"
+          echo "$GHIDRA_SHA256  $RUNNER_TEMP/ghidra.zip" | sha256sum -c
+          for v in fix unfix; do
+            mkdir -p "$RUNNER_TEMP/g-$v"
+            unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$RUNNER_TEMP/g-$v"
+          done
+          echo "GHIDRA_FIX=$(cygpath -w "$RUNNER_TEMP/g-fix/$GHIDRA_DIRNAME")" >> "$GITHUB_ENV"
+          echo "GHIDRA_UNFIX=$(cygpath -w "$RUNNER_TEMP/g-unfix/$GHIDRA_DIRNAME")" >> "$GITHUB_ENV"
+
+      - name: Build LibGhidraHost (with the fix) and install
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p libghidra/ghidra-extension buildExtension -PGHIDRA_INSTALL_DIR="$GHIDRA_FIX"
+          unzip -q libghidra/ghidra-extension/dist/*_LibGhidraHost.zip -d "$(cygpath -u "$GHIDRA_FIX")/Ghidra/Extensions"
+
+      - name: Build LibGhidraHost (main's host code, no fix) and install
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -r libghidra libghidra-nofix
+          rm -rf libghidra-nofix/ghidra-extension/{build,dist,lib}
+          R=ghidra-extension/src/main/java/libghidra/host/runtime
+          for f in FunctionSupport DecompilerSupport FunctionVariableMutationSupport; do
+            git -C libghidra show "origin/main:$R/$f.java" > "libghidra-nofix/$R/$f.java"
+          done
+          git -C libghidra-nofix diff --stat -- "$R"
+          gradle -p libghidra-nofix/ghidra-extension buildExtension -PGHIDRA_INSTALL_DIR="$GHIDRA_UNFIX"
+          unzip -q libghidra-nofix/ghidra-extension/dist/*_LibGhidraHost.zip -d "$(cygpath -u "$GHIDRA_UNFIX")/Ghidra/Extensions"
+
+      - name: Build ghidrasql CLI (MSVC)
+        shell: bash
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGHIDRASQL_LIBGHIDRA_DIR="${{ github.workspace }}/libghidra/cpp"
+          cmake --build build --config Release --target ghidrasql-cli
+          build/bin/Release/ghidrasql.exe --version
+
+      - name: Analyze notepad.exe with both builds and compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/t"
+          src=/c/Windows/System32/notepad.exe
+          [ -f "$src" ] || src=/c/Windows/System32/cmd.exe
+          cp "$src" "$RUNNER_TEMP/t/"
+          export CLI="$(cygpath -w "$PWD/build/bin/Release/ghidrasql.exe")"
+          export TARGET="$(cygpath -w "$RUNNER_TEMP/t/$(basename "$src")")"
+          export OUT="$(cygpath -w "$RUNNER_TEMP/out")"
+          export PYTHONUTF8=1
+          python .github/win-test/run.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-test-results
+          path: |
+            ${{ runner.temp }}/out/demo
+            ${{ runner.temp }}/out/*.json
+            ${{ runner.temp }}/out/*.tsv
+            ${{ runner.temp }}/out/*.out
+            ${{ runner.temp }}/out/*.log
