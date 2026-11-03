@@ -104,6 +104,9 @@ try:
     rows = [l.split("\t") for l in (OUT / "sweep.tsv").read_text().splitlines() if l]
     errs = [r[0] for r in rows if len(r) > 1 and r[1] != "ok"]
     notice("Sweep (fixed)", f"{len(rows) - len(errs)}/{len(rows)} ok; errors: {', '.join(errs) or 'none'}")
+    for r in rows:
+        if len(r) > 1 and r[1] != "ok" and "byte_search" not in r[0]:
+            notice(f"Sweep error: {r[0]}", (r[3] if len(r) > 3 else "")[:600] or "(no detail)")
 except Exception as e:
     notice("Sweep (fixed)", f"no result: {e}", "error")
     failed = True
